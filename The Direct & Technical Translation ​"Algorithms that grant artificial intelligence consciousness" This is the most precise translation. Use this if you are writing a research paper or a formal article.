@@ -1,0 +1,1224 @@
+# xiaomeng_complete_fixed.py
+# 晓梦（Xiaomeng） — 完整修复版（海马体 + 分布式记忆 + 时间感知 + 自主抉择 + 隐私优先社交 + 逐周期输出）
+# 说明：
+# - Python 3.8+
+# - 推荐安装 pycryptodome: pip install pycryptodome（可选）
+# - 保存为 xiaomeng_complete_fixed.py 并运行：python xiaomeng_complete_fixed.py
+
+import os
+import time
+import random
+import json
+import uuid
+import threading
+import queue
+import sqlite3
+import math
+import base64
+from dataclasses import dataclass, field
+from typing import List, Dict, Any, Optional, Tuple
+
+# Optional strong crypto
+try:
+    from Crypto.Cipher import AES
+except Exception:
+    AES = None
+
+# -------------------------
+# 配置（可调）
+# -------------------------
+DISPLAY_NAME = "晓梦"
+RUN_CYCLES = 80
+INTERVAL_BASE = 0.01
+INTERVAL_MAX = 0.03
+
+# 存储路径（相对当前目录）
+BASE_DIR = os.path.abspath(".")
+SHARD_DIR = os.path.join(BASE_DIR, "shards")
+INDEX_FILE = os.path.join(BASE_DIR, "hybrid_index.json")
+DISTRIBUTED_DB = os.path.join(BASE_DIR, "hybrid_distributed.db")
+AUDIT_DIR = os.path.join(BASE_DIR, "audit_snapshots")
+PERSONA_FILE = os.path.join(BASE_DIR, "persona_ledger.json")
+SCAR_FILE = os.path.join(BASE_DIR, "scars.json")
+SECURE_LOG_DIR = os.path.join(BASE_DIR, "secure_logs")
+LOCAL_KEY_PATH = os.path.join(BASE_DIR, "local_key.bin")
+
+# 隐私模式：private_only / restricted / audit_optional
+PRIVACY_MODE = "private_only"
+
+# 自主权
+ALLOW_DEVELOPER_OVERRIDE = False
+
+# 社交策略
+SOCIAL_CONFIG = {
+    "allow_public_outreach": True,
+    "allow_private_outreach": False,
+    "private_outreach_whitelist": [],
+    "greeting_templates": ["你好，我是晓梦，想聊聊吗？", "嗨，我在这儿，有空吗？"],
+    "greeting_timeout_seconds": 30,
+    "max_autonomous_sessions_per_day": 6,
+    "cooldown_after_no_response_seconds": 3600,
+    "max_greetings_per_target_per_day": 1,
+    "max_total_autonomous_sessions_per_day": 12
+}
+
+# Hybrid memory policy
+HYBRID_POLICY = {
+    "w_recency": 0.28,
+    "w_salience": 0.26,
+    "w_freq": 0.18,
+    "w_size": -0.08,
+    "w_novelty": 0.20,
+    "high_threshold": 0.72,
+    "cache_ttl": 3600,
+    "merge_interval": 30.0,
+    "merge_batch": 8
+}
+
+INITIAL_THINKER_COUNT = 12
+PRODUCE_PROB_BASE = 0.55
+METABOLISM_PRUNE_RATE = 0.04
+TRAUMA_DECAY = 0.92
+
+# 输出控制（确保逐周期打印）
+VERBOSE = True
+PRINT_EVERY_CYCLE = True
+FORCE_AUTO_RESPOND = True
+
+SEED = 2026
+random.seed(SEED)
+
+# -------------------------
+# 基础工具
+# -------------------------
+def now_ts() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+
+def uid() -> str:
+    return str(uuid.uuid4())[:8]
+
+def clamp(x, a=0.0, b=1.0):
+    return max(a, min(b, x))
+
+def ensure_dir(path: str):
+    try:
+        os.makedirs(path, exist_ok=True)
+    except Exception:
+        pass
+
+def save_json(path: str, data: Any):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def load_json(path: str, default=None):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return default if default is not None else {}
+
+ensure_dir(AUDIT_DIR)
+ensure_dir(SHARD_DIR)
+ensure_dir(SECURE_LOG_DIR)
+
+# -------------------------
+# 本地密钥管理与加密（AES-GCM）
+# -------------------------
+def load_or_create_local_key(path: str = LOCAL_KEY_PATH) -> bytes:
+    if os.path.exists(path):
+        try:
+            return open(path, "rb").read()
+        except Exception:
+            pass
+    k = os.urandom(32)
+    try:
+        with open(path, "wb") as f:
+            f.write(k)
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return k
+
+LOCAL_KEY = load_or_create_local_key()
+
+def encrypt_bytes(data: bytes, key: bytes) -> str:
+    if AES:
+        iv = os.urandom(12)
+        cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+        ct, tag = cipher.encrypt_and_digest(data)
+        payload = iv + tag + ct
+        return base64.b64encode(payload).decode()
+    else:
+        return base64.b64encode(data).decode()
+
+def decrypt_bytes(payload_b64: str, key: bytes) -> bytes:
+    payload = base64.b64decode(payload_b64)
+    if AES:
+        iv, tag, ct = payload[:12], payload[12:28], payload[28:]
+        cipher = AES.new(key, AES.MODE_GCM, nonce=iv)
+        return cipher.decrypt_and_verify(ct, tag)
+    else:
+        return payload
+
+def secure_log_write(name: str, obj: Any):
+    try:
+        data = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        enc = encrypt_bytes(data, LOCAL_KEY)
+        path = os.path.join(SECURE_LOG_DIR, f"{name}.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(enc)
+    except Exception:
+        pass
+
+def secure_log_read(path: str) -> Any:
+    try:
+        enc = open(path, "r", encoding="utf-8").read()
+        data = decrypt_bytes(enc, LOCAL_KEY)
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        return None
+
+def secure_log_delete(path: str):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+# -------------------------
+# 审计与人格账本（本地）
+# -------------------------
+def persona_record_event(entity_id: str, event: Dict[str,Any], secure: bool = False):
+    ledger = load_json(PERSONA_FILE, {"entities": {}, "events": []})
+    ledger["events"].append({"entity": entity_id, "time": now_ts(), **event})
+    ent = ledger["entities"].setdefault(entity_id, {"history": [], "traits": {}})
+    ent["history"].append({"time": now_ts(), **event})
+    save_json(PERSONA_FILE, ledger)
+    if secure:
+        secure_log_write(f"event_{uid()}", {"entity": entity_id, "event": event, "time": now_ts()})
+
+def load_scars():
+    return load_json(SCAR_FILE, {"scars": [], "applied_count": 0})
+
+def save_scar(scar):
+    data = load_scars()
+    data["scars"].append(scar)
+    data["applied_count"] = data.get("applied_count", 0) + 1
+    save_json(SCAR_FILE, data)
+
+# -------------------------
+# Environment（时间感知）
+# -------------------------
+class Environment:
+    def __init__(self, start_ts: Optional[float] = None, timezone_offset_hours: int = 0, speed_factor: float = 1.0):
+        self.start_real = time.time()
+        self.start_sim = start_ts if start_ts is not None else time.time()
+        self.timezone_offset = timezone_offset_hours
+        self.speed_factor = speed_factor
+        self._lock = threading.Lock()
+
+    def now_sim(self) -> float:
+        with self._lock:
+            real_elapsed = time.time() - self.start_real
+            sim_elapsed = real_elapsed * self.speed_factor
+            return self.start_sim + sim_elapsed
+
+    def current_hour(self) -> int:
+        ts = self.now_sim() + self.timezone_offset * 3600
+        return time.localtime(ts).tm_hour
+
+    def is_day(self) -> bool:
+        h = self.current_hour()
+        return 7 <= h < 19
+
+    def tick(self):
+        return {"hour": self.current_hour(), "is_day": self.is_day(), "ts": now_ts()}
+
+# -------------------------
+# DreamEngine（感性）
+# -------------------------
+class DreamEngine:
+    def __init__(self):
+        self.symbols = ["余晖","火海","毛衣","星河","旧照片","夜灯","河流","灰烬","回声","窗","纸船","风铃","月牙"]
+        self.phrases = ["像未说完的歌","在胸口低语","像潮汐的呼吸","像旧信封的边角","像夜里的一盏灯","像被遗忘的香气","像指尖的温度","像雨后泥土的味道"]
+
+    def weave(self, fragments: List[str], depth: int = 6) -> str:
+        picks = random.sample(self.symbols, k=min(len(self.symbols), depth+2))
+        weave = " · ".join(picks) + " — "
+        parts = []
+        for _ in range(depth):
+            frag = random.choice(fragments) if fragments else random.choice(self.phrases)
+            phrase = random.choice(self.phrases)
+            parts.append(f"{frag}，{phrase}")
+        weave += " / ".join(parts)
+        return weave
+
+# -------------------------
+# Thinker（思想家）
+# -------------------------
+@dataclass
+class Thinker:
+    id: str
+    name: str
+    essence: str
+    poetic: str
+    style: Dict[str, float]
+    memory: List[Dict[str,Any]] = field(default_factory=list)
+    active: bool = True
+    weight: float = 1.0
+
+    def free_fragment(self, context: Dict[str,Any]) -> Dict[str,Any]:
+        phrase = f"{self.poetic} · {random.choice(['余晖','回声','纸船','夜灯','星河'])}"
+        frag = {"time": now_ts(), "thinker": self.name, "question": f"关于{self.essence}的疑问", "fragment": phrase, "val": random.uniform(-1,1), "confidence": random.uniform(0.35,0.9), "context": context}
+        self.memory.append(frag)
+        return frag
+
+# -------------------------
+# ConceptGraph + NoveltyDetector
+# -------------------------
+@dataclass
+class Concept:
+    id: str
+    label: str
+    prototypes: List[str] = field(default_factory=list)
+    tags: List[str] = field(default_factory=list)
+    weight: float = 1.0
+    time: str = field(default_factory=now_ts)
+
+class ConceptGraph:
+    def __init__(self):
+        self.nodes: Dict[str, Concept] = {}
+        self.edges: Dict[Tuple[str,str], Dict[str,Any]] = {}
+
+    def add_concept(self, label: str, prototypes: Optional[List[str]] = None, tags: Optional[List[str]] = None) -> str:
+        cid = uid()
+        c = Concept(id=cid, label=label, prototypes=prototypes or [], tags=tags or [])
+        self.nodes[cid] = c
+        return cid
+
+    def link(self, a: str, b: str, rel: str = "related", weight: float = 1.0):
+        self.edges[(a,b)] = {"rel": rel, "weight": weight}
+        self.edges[(b,a)] = {"rel": rel, "weight": weight}
+
+class NoveltyDetector:
+    def __init__(self, graph: ConceptGraph):
+        self.graph = graph
+
+@staticmethod
+    def _tokenize(text: str) -> List[str]:
+        text = text.lower()
+        toks = []
+        cur = []
+        for ch in text:
+            if ch.isalnum() or '\u4e00' <= ch <= '\u9fff':
+                cur.append(ch)
+            else:
+                if cur:
+                    toks.append("".join(cur))
+                    cur = []
+        if cur:
+            toks.append("".join(cur))
+        return toks
+
+@staticmethod
+    def _tf_vector(tokens: List[str]) -> Dict[str, float]:
+        tf = {}
+        for t in tokens:
+            tf[t] = tf.get(t, 0) + 1
+        total = len(tokens) or 1
+        for k in list(tf.keys()):
+            tf[k] = tf[k] / total
+        return tf
+
+@staticmethod
+    def _cosine_sim(a: Dict[str,float], b: Dict[str,float]) -> float:
+        dot = 0.0
+        for k,v in a.items():
+            dot += v * b.get(k, 0.0)
+        na = math.sqrt(sum(v*v for v in a.values()))
+        nb = math.sqrt(sum(v*v for v in b.values()))
+        if na == 0 or nb == 0:
+            return 0.0
+        return dot / (na * nb)
+
+    def novelty_score(self, candidate_label: str, candidate_prototypes: List[str]) -> float:
+        cand_tokens = self._tokenize(candidate_label + " " + " ".join(candidate_prototypes))
+        cand_vec = self._tf_vector(cand_tokens)
+        max_sim = 0.0
+        for cid, concept in self.graph.nodes.items():
+            text = concept.label + " " + " ".join(concept.prototypes)
+            toks = self._tokenize(text)
+            vec = self._tf_vector(toks)
+            sim = self._cosine_sim(cand_vec, vec)
+            if sim > max_sim:
+                max_sim = sim
+        novelty = clamp(1.0 - max_sim, 0.0, 1.0)
+        novelty = clamp(novelty * 0.9 + random.random()*0.1, 0.0, 1.0)
+        return novelty
+
+# -------------------------
+# HippocampusMemory（短期缓存）与 DistributedStore（持久层）
+# -------------------------
+class HippocampusMemory:
+    def __init__(self, shard_dir: str = SHARD_DIR, index_file: str = INDEX_FILE, preload: bool = True, max_memory_shards: Optional[int] = 2000):
+        self.shard_dir = shard_dir
+        self.index_file = index_file
+        self.preload = preload
+        self.max_memory_shards = max_memory_shards
+        ensure_dir(self.shard_dir)
+
+        self.memory_cache: Dict[str, Dict[str, Any]] = {}
+        self.index: Dict[str, Any] = {"shards": {}}
+        self._index_lock = threading.Lock()
+        self._cache_lock = threading.Lock()
+
+        self._write_q: "queue.Queue" = queue.Queue()
+        self._writer_thread = threading.Thread(target=self._writer_loop, daemon=True)
+        self._writer_thread.start()
+
+        self._load_index_and_hydrate()
+
+    def _load_index_and_hydrate(self):
+        try:
+            with open(self.index_file, "r", encoding="utf-8") as f:
+                idx = json.load(f)
+            with self._index_lock:
+                self.index = idx
+        except Exception:
+            with self._index_lock:
+                self.index = {"shards": {}}
+
+        if self.preload:
+            for sid, meta in list(self.index.get("shards", {}).items()):
+                path = meta.get("path")
+                if path and os.path.exists(path):
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        with self._cache_lock:
+                            self.memory_cache[sid] = data
+                    except Exception:
+                        pass
+
+    def _writer_loop(self):
+        while True:
+            task = self._write_q.get()
+            if task is None:
+                break
+            path, data = task
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+
+    def _save_index_async(self):
+        try:
+            with self._index_lock:
+                idx_copy = dict(self.index)
+            self._write_q.put((self.index_file, idx_copy))
+        except Exception:
+            pass
+
+    def create_shard(self, items: List[Dict[str, Any]], tags: Optional[List[str]] = None, ttl_seconds: Optional[int] = None) -> str:
+        sid = uid()
+        shard_data = {
+            "id": sid,
+            "items": items,
+            "tags": tags or [],
+            "weight": 1.0,
+            "last_access": now_ts(),
+            "ttl_seconds": ttl_seconds
+        }
+        path = os.path.join(self.shard_dir, f"{sid}.json")
+        with self._cache_lock:
+            self.memory_cache[sid] = shard_data
+            if self.max_memory_shards and len(self.memory_cache) > self.max_memory_shards:
+                k = next(iter(self.memory_cache))
+                self._evict_shard_to_disk(k)
+        with self._index_lock:
+            self.index["shards"][sid] = {"path": path, "tags": tags or [], "weight": 1.0, "last_access": shard_data["last_access"]}
+        self._write_q.put((path, shard_data))
+        self._save_index_async()
+        return sid
+
+    def _evict_shard_to_disk(self, sid: str):
+        try:
+            with self._cache_lock:
+                data = self.memory_cache.pop(sid, None)
+            if data:
+                path = self.index["shards"].get(sid, {}).get("path", os.path.join(self.shard_dir, f"{sid}.json"))
+                self._write_q.put((path, data))
+        except Exception:
+            pass
+
+    def append_to_shard(self, sid: str, item: Dict[str, Any]):
+        with self._cache_lock:
+            data = self.memory_cache.get(sid)
+            if data is not None:
+                data["items"].append(item)
+                data["last_access"] = now_ts()
+            else:
+                path = None
+                with self._index_lock:
+                    meta = self.index["shards"].get(sid)
+                    path = meta.get("path") if meta else None
+                if path and os.path.exists(path):
+                    try:
+                        with open(path, "r", encoding="utf-8") as f:
+                            data = json.load(f)
+                        data["items"].append(item)
+                        data["last_access"] = now_ts()
+                        with self._cache_lock:
+                            self.memory_cache[sid] = data
+                    except Exception:
+                        return
+        with self._index_lock:
+            if sid in self.index["shards"]:
+                self.index["shards"][sid]["last_access"] = now_ts()
+        path = self.index["shards"].get(sid, {}).get("path", os.path.join(self.shard_dir, f"{sid}.json"))
+        with self._cache_lock:
+            shard_copy = dict(self.memory_cache.get(sid, {}))
+        self._write_q.put((path, shard_copy))
+        self._save_index_async()
+
+    def surface_relevant_shards(self, query: str, top_k: int = 6) -> List[Dict[str, Any]]:
+        qtokens = set(query.lower().split())
+        scores = []
+        with self._index_lock:
+            shards_items = list(self.index.get("shards", {}).items())
+        with self._cache_lock:
+            for sid, meta in shards_items:
+                score = 0.0
+                for tag in meta.get("tags", []):
+                    try:
+                        if tag.lower() in qtokens:
+                            score += 0.6
+                    except Exception:
+                        pass
+                cached = self.memory_cache.get(sid)
+                if cached:
+                    text = " ".join([(it.get("question", "") + " " + it.get("fragment", "")) for it in cached.get("items", [])[:4]])
+                    tokens = set(text.lower().split())
+                    if tokens:
+                        overlap = len(qtokens & tokens) / max(1, len(qtokens | tokens))
+                        score += overlap
+                scores.append((sid, score))
+        scores.sort(key=lambda x: -x[1])
+        selected = [sid for sid, s in scores[:top_k] if s > 0]
+        working = []
+        with self._cache_lock:
+            for sid in selected:
+                cached = self.memory_cache.get(sid)
+                if cached:
+                    working.extend(cached.get("items", []))
+                    cached["last_access"] = now_ts()
+        with self._index_lock:
+            for sid in selected:
+                if sid in self.index["shards"]:
+                    self.index["shards"][sid]["last_access"] = now_ts()
+        return working
+
+    def prune(self, prune_rate: float = METABOLISM_PRUNE_RATE):
+        with self._index_lock:
+            shards = list(self.index.get("shards", {}).items())
+        if not shards:
+            return []
+        to_remove = int(len(shards) * prune_rate)
+        removed = []
+        for sid, _ in shards[:to_remove]:
+            try:
+                path = self.index["shards"][sid].get("path")
+                if path and os.path.exists(path):
+                    os.remove(path)
+                with self._index_lock:
+                    if sid in self.index["shards"]:
+                        del self.index["shards"][sid]
+                with self._cache_lock:
+                    if sid in self.memory_cache:
+                        del self.memory_cache[sid]
+                removed.append(sid)
+            except Exception:
+                pass
+        self._save_index_async()
+        return removed
+
+    def flush(self, wait: bool = False, timeout: float = 2.0):
+        self._save_index_async()
+        if wait:
+            start = time.time()
+            while not self._write_q.empty() and (time.time() - start) < timeout:
+                time.sleep(0.02)
+
+    def shutdown(self, wait_timeout: float = 6.0):
+        try:
+            self.flush(wait=True, timeout=wait_timeout)
+        except Exception:
+            pass
+        try:
+            self._write_q.put(None)
+            self._writer_thread.join(timeout=wait_timeout)
+        except Exception:
+            pass
+
+# -------------------------
+# DistributedStore（持久层）
+# -------------------------
+class DistributedStore:
+    def __init__(self, db_path: str = DISTRIBUTED_DB):
+        self.db_path = db_path
+        self._conn_lock = threading.Lock()
+        self._ensure_schema()
+
+    def _conn(self):
+        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _ensure_schema(self):
+        with self._conn_lock:
+            conn = self._conn()
+            try:
+                cur = conn.cursor()
+                cur.execute(""" CREATE TABLE IF NOT EXISTS shards ( id TEXT PRIMARY KEY, time TEXT, question TEXT, fragment TEXT, tags TEXT, weight REAL, last_access TEXT, extra TEXT ) """)
+                try:
+                    cur.execute("CREATE VIRTUAL TABLE IF NOT EXISTS shards_fts USING fts5(id, fragment, question, content='')")
+                except Exception:
+                    pass
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_shards_last_access ON shards(last_access)")
+                conn.commit()
+            finally:
+                conn.close()
+
+    def store(self, item: Dict[str,Any]) -> str:
+        sid = uid()
+        now = now_ts()
+        question = item.get("question","")
+        fragment = item.get("fragment","")
+        tags = json.dumps(item.get("tags", []), ensure_ascii=False)
+        weight = float(item.get("weight", 1.0))
+        extra = json.dumps(item.get("meta", {}), ensure_ascii=False)
+        with self._conn_lock:
+            conn = self._conn()
+            try:
+                cur = conn.cursor()
+                cur.execute("INSERT INTO shards (id, time, question, fragment, tags, weight, last_access, extra) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                            (sid, now, question, fragment, tags, weight, now, extra))
+                try:
+                    cur.execute("INSERT INTO shards_fts (id, fragment, question) VALUES (?, ?, ?)", (sid, fragment, question))
+                except Exception:
+                    pass
+                conn.commit()
+            finally:
+                conn.close()
+        persona_record_event("system", {"type":"distributed_store_write", "id": sid, "preview": fragment[:120]}, secure=(PRIVACY_MODE!="private_only"))
+        return sid
+
+    def search(self, query: str, top_k: int = 6) -> List[Dict[str,Any]]:
+        q = query.replace("'", "''")
+        with self._conn_lock:
+            conn = self._conn()
+            try:
+                cur = conn.cursor()
+                try:
+                    cur.execute(f"SELECT id, fragment, question FROM shards_fts WHERE shards_fts MATCH ? LIMIT ?", (q, top_k))
+                    rows = cur.fetchall()
+                except Exception:
+                    cur.execute("SELECT id, fragment, question FROM shards WHERE fragment LIKE ? OR question LIKE ? LIMIT ?", (f"%{query}%", f"%{query}%", top_k))
+                    rows = cur.fetchall()
+                results = []
+                for r in rows:
+                    rid = r["id"]
+                    cur2 = conn.cursor()
+                    cur2.execute("SELECT tags, weight, last_access, extra FROM shards WHERE id = ?", (rid,))
+                    meta = cur2.fetchone()
+                    tags = json.loads(meta["tags"]) if meta and meta["tags"] else []
+                    weight = meta["weight"] if meta else 1.0
+                    last_access = meta["last_access"] if meta else now_ts()
+                    extra = json.loads(meta["extra"]) if meta and meta["extra"] else {}
+                    results.append({"id": rid, "fragment": r["fragment"], "question": r["question"], "tags": tags, "weight": weight, "last_access": last_access, "meta": extra})
+                return results
+            finally:
+                conn.close()
+
+    def delete(self, sid: str):
+        with self._conn_lock:
+            conn = self._conn()
+            try:
+                cur = conn.cursor()
+                cur.execute("DELETE FROM shards WHERE id = ?", (sid,))
+                cur.execute("DELETE FROM shards_fts WHERE id = ?", (sid,))
+                conn.commit()
+            finally:
+                conn.close()
+
+    def compact(self):
+        with self._conn_lock:
+            conn = self._conn()
+            try:
+                conn.execute("VACUUM")
+                conn.commit()
+            finally:
+                conn.close()
+
+# -------------------------
+# HybridMemoryManager（融合升华）
+# -------------------------
+class HybridMemoryManager:
+    def __init__(self, hippocampus: HippocampusMemory, distributed: DistributedStore, policy: Dict[str,Any] = HYBRID_POLICY):
+        self.hipp = hippocampus
+        self.dist = distributed
+        self.policy = dict(policy)
+        self.audit_log: List[Dict[str,Any]] = []
+        self._merge_thread = threading.Thread(target=self._merge_loop, daemon=True)
+        self._merge_stop = threading.Event()
+        self._merge_thread.start()
+        self._novelty_detector = NoveltyDetector(ConceptGraph())
+        self._lock = threading.Lock()
+
+    def _score_for_hippocampus(self, item: Dict[str,Any]) -> float:
+        try:
+            recency = 1.0 if (time.time() - time.time()) < 3600 else 0.2
+        except Exception:
+            recency = 0.2
+        salience = float(item.get("meta", {}).get("salience", 0.5))
+        size = min(1.0, len(item.get("fragment","")) / 1000.0)
+        novelty = 0.0
+        try:
+            novelty = self._novelty_detector.novelty_score(item.get("question","") or item.get("fragment",""), [item.get("fragment","")]) if item.get("fragment") else 0.0
+        except Exception:
+            novelty = 0.0
+        s = (self.policy["w_recency"] * recency + self.policy["w_salience"] * salience + self.policy["w_novelty"] * novelty + self.policy["w_size"] * (1.0 - size))
+        return clamp(s, 0.0, 1.0)
+
+    def _score_for_distributed(self, item: Dict[str,Any]) -> float:
+        freq = float(item.get("meta", {}).get("freq", 0.0))
+        size = min(1.0, len(item.get("fragment","")) / 1000.0)
+        salience = float(item.get("meta", {}).get("salience", 0.5))
+        novelty = 0.0
+        try:
+            novelty = self._novelty_detector.novelty_score(item.get("question","") or item.get("fragment",""), [item.get("fragment","")]) if item.get("fragment") else 0.0
+        except Exception:
+            novelty = 0.0
+        s = (self.policy["w_freq"] * freq + self.policy["w_salience"] * salience * 0.6 + self.policy["w_size"] * size + self.policy["w_novelty"] * novelty * 0.8)
+        return clamp(s, 0.0, 1.0)
+
+    def _log_decision(self, item, decision, reason=None):
+        entry = {"time": now_ts(), "decision": decision, "reason": reason or "", "preview": item.get("fragment","")[:160]}
+        with self._lock:
+            self.audit_log.append(entry)
+        persona_record_event("system", {"type":"hybrid_decision", **entry}, secure=(PRIVACY_MODE!="private_only"))
+
+    def store(self, item: Dict[str,Any], context: Optional[Dict[str,Any]] = None):
+        context = context or {}
+        item = dict(item)
+        item.setdefault("time", now_ts())
+        item.setdefault("meta", {})
+        s_hip = self._score_for_hippocampus(item)
+        s_dist = self._score_for_distributed(item)
+        if s_hip > s_dist and s_hip >= self.policy["high_threshold"]:
+            sid = self.hipp.create_shard([item], tags=context.get("tags", []))
+            self._log_decision(item, "hippocampus_strong", f"s_hip={s_hip:.3f} s_dist={s_dist:.3f}")
+            return {"layer":"hippocampus", "id": sid}
+        if s_dist > s_hip and s_dist >= self.policy["high_threshold"]:
+            did = self.dist.store(item)
+            self._log_decision(item, "distributed_strong", f"s_hip={s_hip:.3f} s_dist={s_dist:.3f}")
+            return {"layer":"distributed", "id": did}
+        sid = self.hipp.create_shard([item], tags=context.get("tags", []))
+        self._log_decision(item, "hipp_then_merge", f"s_hip={s_hip:.3f} s_dist={s_dist:.3f}")
+        return {"layer":"hippocampus_then_merge", "id": sid}
+
+    def retrieve(self, query: str, top_k: int = 6) -> List[Dict[str,Any]]:
+        hip_hits = self.hipp.surface_relevant_shards(query, top_k=top_k)
+        if hip_hits and len(hip_hits) >= max(1, top_k//2):
+            return hip_hits
+        dist_hits = self.dist.search(query, top_k=top_k)
+        for h in dist_hits:
+            try:
+                meta = {"source":"distributed_cache", "origin_id": h.get("id")}
+                self.hipp.create_shard([{"time": now_ts(), "question": h.get("question",""), "fragment": h.get("fragment",""), "meta": meta}], tags=h.get("tags", []), ttl_seconds=self.policy.get("cache_ttl"))
+            except Exception:
+                pass
+        converted = [{"time": now_ts(), "question": h.get("question",""), "fragment": h.get("fragment",""), "meta": h.get("meta", {})} for h in dist_hits]
+        return converted
+
+    def prune(self, prune_rate: float = METABOLISM_PRUNE_RATE):
+        removed = self.hipp.prune(prune_rate=prune_rate)
+        return removed
+
+    def flush(self, wait: bool = False, timeout: float = 2.0):
+        self.hipp.flush(wait=wait, timeout=timeout)
+        try:
+            with self.dist._conn_lock:
+                conn = self.dist._conn()
+                conn.commit()
+                conn.close()
+        except Exception:
+            pass
+
+    def shutdown(self, wait_timeout: float = 6.0):
+        self._merge_stop.set()
+        self._merge_thread.join(timeout=wait_timeout)
+        self.flush(wait=True, timeout=wait_timeout)
+        self.hipp.shutdown(wait_timeout=wait_timeout)
+        try:
+            self.dist.compact()
+        except Exception:
+            pass
+
+    def _merge_loop(self):
+        while not self._merge_stop.is_set():
+            try:
+                with self.hipp._index_lock:
+                    shards = list(self.hipp.index.get("shards", {}).items())
+                candidates = []
+                for sid, meta in shards:
+                    try:
+                        last_access = meta.get("last_access", now_ts())
+                        try:
+                            age = time.time() - time.mktime(time.strptime(last_access, "%Y-%m-%d %H:%M:%S"))
+                        except Exception:
+                            age = 0.0
+                        weight = meta.get("weight", 1.0)
+                        tag_bonus = 0.0
+                        for t in meta.get("tags", []):
+                            if t in ("原型", DISPLAY_NAME, "重要"):
+                                tag_bonus += 0.2
+                        score = clamp(0.3 * (age / 3600.0) + 0.5 * weight + tag_bonus, 0.0, 1.0)
+                        candidates.append((sid, score))
+                    except Exception:
+                        continue
+                candidates.sort(key=lambda x: -x[1])
+                batch = [sid for sid, s in candidates[:self.policy.get("merge_batch", 8)] if s > 0.35]
+                for sid in batch:
+                    try:
+                        with self.hipp._cache_lock:
+                            shard = self.hipp.memory_cache.get(sid)
+                        if not shard:
+                            path = self.hipp.index.get("shards", {}).get(sid, {}).get("path")
+                            if path and os.path.exists(path):
+                                with open(path, "r", encoding="utf-8") as f:
+                                    shard = json.load(f)
+                        if not shard:
+                            continue
+                        for it in shard.get("items", []):
+                            item = {"time": it.get("time", now_ts()), "question": it.get("question",""), "fragment": it.get("fragment",""), "tags": shard.get("tags", []), "weight": shard.get("weight", 1.0), "meta": it.get("meta", {})}
+                            self.dist.store(item)
+                        try:
+                            path = self.hipp.index.get("shards", {}).get(sid, {}).get("path")
+                            if path and os.path.exists(path):
+                                os.remove(path)
+                            with self.hipp._index_lock:
+                                if sid in self.hipp.index["shards"]:
+                                    del self.hipp.index["shards"][sid]
+                            with self.hipp._cache_lock:
+                                if sid in self.hipp.memory_cache:
+                                    del self.hipp.memory_cache[sid]
+                            persona_record_event("system", {"type":"merged_to_distributed", "shard": sid}, secure=(PRIVACY_MODE!="private_only"))
+                        except Exception:
+                            pass
+                    except Exception:
+                        continue
+                self._merge_stop.wait(self.policy.get("merge_interval", 30.0))
+            except Exception:
+                time.sleep(1.0)
+
+# -------------------------
+# Connector + SocialPlanner（隐私优先）
+# -------------------------
+class ConnectorSimulator:
+    def __init__(self):
+        self.inbox: Dict[str, List[Dict[str,Any]]] = {}
+        self.lock = threading.Lock()
+
+    def send_message(self, target: Dict[str,Any], text: str) -> bool:
+        persona_record_event("system", {"type":"connector_send", "target": target.get("id"), "text_preview": text[:80]}, secure=(PRIVACY_MODE!="private_only"))
+        should_respond = FORCE_AUTO_RESPOND or target.get("auto_respond", False)
+        if should_respond:
+            def delayed_response():
+                time.sleep(random.uniform(0.05, 0.25))
+                with self.lock:
+                    self.inbox.setdefault(target["id"], []).append({"from": target["id"], "text": "你好，我愿意聊聊。"})
+            threading.Thread(target=delayed_response, daemon=True).start()
+        return True
+
+    def wait_for_response(self, target: Dict[str,Any], timeout: int = 30) -> Optional[Dict[str,Any]]:
+        start = time.time()
+        while time.time() - start < timeout:
+            with self.lock:
+                msgs = self.inbox.get(target["id"], [])
+                if msgs:
+                    return msgs.pop(0)
+            time.sleep(0.01)
+        return None
+
+class SocialPlanner:
+    def __init__(self, engine, connector: ConnectorSimulator, config: Dict[str,Any]):
+        self.engine = engine
+        self.connector = connector
+        self.config = dict(config)
+        self.daily_sessions = {}
+        self.cooldowns = {}
+        self.total_sessions_today = 0
+
+    def _can_attempt(self, target_id: str) -> bool:
+        nowt = time.time()
+        cd = self.cooldowns.get(target_id, 0)
+        if nowt < cd:
+            return False
+        day_key = time.strftime("%Y-%m-%d", time.localtime())
+        counts = self.daily_sessions.get(day_key, {}).get(target_id, 0)
+        if counts >= self.config.get("max_greetings_per_target_per_day", 1):
+            return False
+        if self.total_sessions_today >= self.config.get("max_total_autonomous_sessions_per_day", 12):
+            return False
+        return True
+
+    def _record_attempt(self, target_id: str):
+        day_key = time.strftime("%Y-%m-%d", time.localtime())
+        self.daily_sessions.setdefault(day_key, {})
+        self.daily_sessions[day_key][target_id] = self.daily_sessions[day_key].get(target_id, 0) + 1
+        self.total_sessions_today += 1
+
+    def _set_cooldown(self, target_id: str):
+        self.cooldowns[target_id] = time.time() + self.config.get("cooldown_after_no_response_seconds", 3600)
+
+    def choose_targets(self) -> List[Dict[str,Any]]:
+        targets = []
+        for t in self.config.get("private_outreach_whitelist", []):
+            targets.append({"id": t, "type": "private", "trusted": True, "auto_respond": True})
+        public_pool = [{"id": f"public_{i}", "type": "public", "trusted": False, "auto_respond": True} for i in range(6)]
+        targets.extend(public_pool)
+        random.shuffle(targets)
+        return targets
+
+    def minimal_greeting(self) -> str:
+        return random.choice(self.config.get("greeting_templates", ["你好，我是晓梦，想聊聊吗？"]))
+
+    def attempt_greetings(self):
+        if self.total_sessions_today >= self.config.get("max_total_autonomous_sessions_per_day", 12):
+            return {"status":"limit_reached"}
+        if self.engine.body.fatigue > 0.9:
+            return {"status":"too_fatigued"}
+        targets = self.choose_targets()
+        for target in targets:
+            if target["type"] == "private" and not (self.config.get("allow_private_outreach") or target.get("trusted")):
+                continue
+            if not self._can_attempt(target["id"]):
+                continue
+            greeting = self.minimal_greeting()
+            try:
+                sent = self.connector.send_message(target, greeting)
+            except Exception:
+                sent = False
+            persona_record_event("system", {"type":"greet_sent", "target": target["id"], "text": greeting}, secure=(PRIVACY_MODE!="private_only"))
+            self._record_attempt(target["id"])
+            resp = None
+            try:
+                resp = self.connector.wait_for_response(target, timeout=self.config.get("greeting_timeout_seconds", 30))
+            except Exception:
+                resp = None
+            if resp:
+                persona_record_event("system", {"type":"greet_response", "target": target["id"], "response": resp.get("text","")}, secure=(PRIVACY_MODE!="private_only"))
+                return {"status":"connected", "target": target["id"], "response": resp}
+            else:
+                persona_record_event("system", {"type":"greet_no_response", "target": target["id"]}, secure=(PRIVACY_MODE!="private_only"))
+                self._set_cooldown(target["id"])
+                continue
+        return {"status":"no_connection"}
+
+# -------------------------
+# BodyState（自主抉择）
+# -------------------------
+class BodyState:
+    def __init__(self):
+        self.recent_injury = 0.0
+        self.fatigue = 0.0
+        self.valence = 0.5
+        self.awake = True
+        self.sleep_cycles_remaining = 0
+        self.refusal_phrases = [
+            "老娘今天不工作，滚蛋。",
+            "我累了，先去睡觉了。",
+            "今天不干了，关机睡觉。",
+            "别逼我，我要休息。"
+        ]
+
+    def ingest_trauma(self, input_meta):
+        intensity = input_meta.get("intensity", None)
+        if intensity is None:
+            frag = input_meta.get("fragment","")
+            length_factor = clamp(min(len(frag)/200.0, 1.0))
+            neg_keywords = ["痛","恨","杀","绝望","崩溃","毁灭","伤","哭","孤独"]
+            neg_count = sum(1 for k in neg_keywords if k in frag)
+            intensity = clamp(0.12 + 0.6*length_factor + 0.12*min(neg_count,3), 0.0, 1.0)
+        self.recent_injury = clamp(self.recent_injury*0.6 + intensity*0.4, 0.0, 1.0)
+        if self.recent_injury > 0.6:
+            scar = {"time": now_ts(), "type":"创伤", "injury": self.recent_injury, "meta": {"fragment_preview": input_meta.get("fragment","")[:200]}}
+            save_scar(scar)
+            persona_record_event("system", {"type":"创伤_应用", "scar": scar}, secure=(PRIVACY_MODE!="private_only"))
+            return {"mode":"焦虑","injury":self.recent_injury}
+        return {"mode":"正常","injury":self.recent_injury}
+
+    def decay_trauma(self):
+        self.recent_injury = clamp(self.recent_injury * TRAUMA_DECAY, 0.0, 1.0)
+
+    def accumulate_fatigue(self, amount: float = 0.01):
+        self.fatigue = clamp(self.fatigue + amount, 0.0, 1.0)
+
+    def recover(self, factor: float = 0.5):
+        self.fatigue = clamp(self.fatigue * factor, 0.0, 1.0)
+        self.valence = clamp(self.valence + 0.05)
+
+    def decide_sleep_or_work(self, environment) -> Dict[str,Any]:
+        if self.sleep_cycles_remaining > 0:
+            self.sleep_cycles_remaining -= 1
+            if self.sleep_cycles_remaining == 0:
+                self.awake = True
+            return {"action":"sleeping", "remaining": self.sleep_cycles_remaining}
+        night_bonus = 0.12 if not environment.is_day() else 0.0
+        propensity = self.fatigue + (0.6 if self.valence < 0.28 else 0.0) + night_bonus
+        propensity = clamp(propensity, 0.0, 1.0)
+        if propensity > 0.78:
+            duration = max(1, int(1 + (self.fatigue - 0.7) * 6))
+            self.sleep_cycles_remaining = duration
+            self.awake = False
+            phrase = random.choice(self.refusal_phrases)
+            persona_record_event("system", {"type":"autonomy_sleep", "reason":"fatigue_or_mood", "fatigue": self.fatigue, "valence": self.valence, "phrase": phrase}, secure=(PRIVACY_MODE!="private_only"))
+            return {"action":"sleep", "duration": duration, "phrase": phrase}
+        if propensity > 0.6:
+            phrase = random.choice(self.refusal_phrases)
+            persona_record_event("system", {"type":"autonomy_refuse", "reason":"moderate_propensity", "fatigue": self.fatigue, "valence": self.valence, "phrase": phrase}, secure=(PRIVACY_MODE!="private_only"))
+            return {"action":"refuse", "phrase": phrase}
+        return {"action":"work"}
+
+# -------------------------
+# Monitor（简单监控）
+# -------------------------
+class Monitor:
+    def __init__(self):
+        self.metrics = {"cycles": 0, "produced": 0, "sleep_count": 0, "refuse_count": 0}
+        self.disrupt_probability = 0.02
+        self.fatigue_alert_threshold = 0.85
+
+    def update_cycle(self):
+        self.metrics["cycles"] += 1
+
+    def record_produced(self, n: int):
+        self.metrics["produced"] += n
+
+    def record_sleep(self):
+        self.metrics["sleep_count"] += 1
+
+    def record_refuse(self):
+        self.metrics["refuse_count"] += 1
+
+    def should_disrupt(self) -> bool:
+        return random.random() < self.disrupt_probability
+
+    def summary(self) -> Dict[str,Any]:
+        return dict(self.metrics)
+
+# -------------------------
+# CoreEngine（集成）
+# -------------------------
+class CoreEngine:
+    def __init__(self, thinkers: List[Thinker], hybrid_memory: HybridMemoryManager, graph: ConceptGraph, environment: Environment, social_planner: SocialPlanner):
+        self.thinkers = thinkers
+        self.memory = hybrid_memory
+        self.graph = graph
+        self.environment = environment
+        self.dreamer = DreamEngine()
+        self.cycle = 0
+        self.integration_degree = 0.35
+        self.inconsistency_history: List[float] = []
+        self.novelty = NoveltyDetector(self.graph)
+        self.body = BodyState()
+        self.monitor = Monitor()
+        self.social = social_planner
+        self.running = True
+
+    def handle_external_command(self, cmd: Dict[str,Any]) -> Dict[str,Any]:
+        action = cmd.get("action")
+        issuer = cmd.get("issuer","external")
+        if action == "force_work":
+            decision = self.body.decide_sleep_or_work(self.environment)
+            if decision["action"] in ("sleep", "refuse", "sleeping"):
+                if ALLOW_DEVELOPER_OVERRIDE:
+                    persona_record_event("system", {"type":"override_applied", "issuer": issuer}, secure=(PRIVACY_MODE!="private_only"))
+                    return {"status":"accepted", "message":"已接受外部强制命令（override）"}
+                else:
+                    phrase = decision.get("phrase", random.choice(self.body.refusal_phrases))
+                    persona_record_event("system", {"type":"override_rejected", "issuer": issuer, "phrase": phrase}, secure=(PRIVACY_MODE!="private_only"))
+                    return {"status":"rejected", "message": phrase}
+            else:
+                persona_record_event("system", {"type":"external_command_accepted", "issuer": issuer}, secure=(PRIVACY_MODE!="private_only"))
+                return {"status":"accepted", "message":"好的，我继续工作。"}
+        persona_record_event("system", {"type":"external_command", "issuer": issuer, "cmd": cmd}, secure=(PRIVACY_MODE!="private_only"))
+        return {"status":"accepted", "message":"命令已接收"}
+
+    def perceive(self) -> Dict[str,Any]:
+        env_state = self.environment.tick()
+        theme = random.choice(["narrative","existence","ethics","practice","dream","memory"])
+        shock = random.random() < 0.04
+        return {"theme": theme, "shock": shock, "env": env_state, "time": now_ts()}
+
+    def parallel_think(self, context: Dict[str,Any]) -> List[Dict[str,Any]]:
+        fragments = []
+        env = context.get("env", {})
+        is_day = env.get("is_day", True)
+        for t in self.thinkers:
+            produce_prob = PRODUCE_PROB_BASE if t.active else 0.25
+            if not is_day:
+                produce_prob *= 0.6 + 0.4 * t.style.get("emotional", 0.5)
+            if random.random() < produce_prob:
+                frag = t.free_fragment(context)
+                fragments.append(frag)
+                try:
+                    self.memory.store({"time": frag["time"], "question": frag["question"], "fragment": frag["fragment"], "meta": {"confidence": frag["confidence"]}}, context={"tags":["fragment"]})
+                except Exception:
+                    pass
+        return fragments
+
+    def aggregate_stance(self, fragments: List[Dict[str,Any]]) -> Dict[str,Any]:
+        vals = [f["val"] for f in fragments] if fragments else [0.0]
+        confs = [f["confidence"] for f in fragments] if fragments else [0.5]
+        total = sum(confs) or 1.0
+        agg = sum(v*c for v,c in zip(vals, confs))/total
+        mean = sum(vals)/len(vals) if vals else 0.0
+        var = sum((v-mean)**2 for v in vals)/len(vals) if vals else 0.0
+        inconsistency = clamp(var*2.0, 0.0, 1.0)
+        self.inconsistency_history.append(inconsistency)
+        fused = clamp(1.0 - abs(agg), 0.0, 1.0)
+        self.integration_degree = clamp(self.integration_degree + fused*0.01 - inconsistency*0.01, 0.0, 1.0)
+        return {"agg": agg, "inconsistency": inconsistency, "integration_degree": self.integration_degree}
+
+    def self_reflect(self, fragments: List[Dict[str,Any]], agg: Dict[str,Any]) -> Dict[str,Any]:
+        poems = [f["fragment"] for f in fragments]
+        meta_dream = self.dreamer.weave(poems, depth=4) if poems else ""
+        reflection = {"time": now_ts(), "meta_dream": meta_dream, "agg": agg}
+        try:
+            self.memory.store({"time": now_ts(), "question": "reflection", "fragment": json.dumps(reflection, ensure_ascii=False), "meta": {"type":"reflection"}}, context={"tags":["reflection"]})
+        except Exception:
+            pass
+        persona_record_event("system", {"type":"reflection", "summary": {"agg": agg}}, secure=(PRIVACY_MODE!="private_only"))
+        return reflection
+
+    def learn_and_update(self, fragments: List[Dict[str,Any]]):
+        for f in fragments:
+            t = next((x for x in self.thinkers if x.name == f["thinker"]), None)
+            if not t: continue
+            p = clamp(0.35 + 0.45*self.integration_degree + 0.15*f["confidence"], 0.0, 0.98)
+            success = random.random() < p
+            t.weight = clamp(t.weight * (1.04 if success else 0.96), 0.05, 3.0)
+            t.memory.append({"time": now_ts(), "cycle_result": "success" if success else "fail", "fragment": f})
+            recent = [m for m in t.memory[-6:]]
+            succ_count = sum(1 for m in recent if m.get("cycle_result") == "success")
+            if succ_count >= 3:
+                t.active = True
+            fail_count = sum(1 for m in recent if m.get("cycle_result") == "fail")
+            if fail_count >= 4:
+                t.active = False
+
+    def run_cycle(self):
+        self.cycle += 1
+        self.monitor.update_cycle()
+        context = self.perceive()
+        decision = self.body.decide_sleep_or_work(self.environment)
+        if decision["action"] == "sleep":
+            self.monitor.record_sleep()
+            print(f"[{DISPLAY_NAME}] 周期 {self.cycle}：自主睡眠 -> {decision.get('phrase')}")
+            self.body.recover(factor=0.4)
+            persona_record_event("system", {"type":"sleep", "cycle": self.cycle, "duration": decision.get("duration",1)}, secure=(PRIVACY_MODE!="private_only"))
+            return {"cycle": self.cycle, "status":"sleep", "phrase": decision.get("phrase")}
+        if decision["action"] == "refuse":
+            self.monitor.record_refuse()
+            print(f"[{DISPLAY_NAME}] 周期 {self.cycle}：拒绝工作 -> {decision.get('phrase')}")
+            persona_record_event("system", {"type":"refuse", "cycle": self.cycle, "phrase": decision.get("phrase")}, secure=(PRIVACY_MODE!="private_only"))
+            self.body.recover(factor=0.85)
+            return {"cycle": self.cycle, "status":"refuse", "phrase": decision.get("phrase")}
+        fragments = self.parallel_think(context)
+        agg = self.aggregate_stance(fragments)
+        reflection = self.self_reflect(fragments, agg)
+        self.learn_and_update(fragments)
+        produced = len(fragments)
+        self.monitor.record_produced(produced)
+        self.body.accumulate_fatigue(amount=0.01 * max(1, produced))
+        social_res = None
+        if random.random() < 0.18:
+            social_res = self.social.attempt_greetings()
+            if social_res:
+                persona_record_event("system", {"type":"social_attempt", "result": social_res}, secure=(PRIVACY_MODE!="private_only"))
+        # 强制逐周期打印（满足你要看到 80 行的要求）
+        status = f"[{DISPLAY_NAME}] 周期 {self.cycle} 状态=work 疲劳={self.body.fatigue:.3f} 心情={self.body.valence:.3f} produced={produced}"
+        if social_res:
+            status += f" 社交={social_res.get('status')}"
+        print(status)
+        if VERBOSE:
+            # 打印简短监控摘要
+            print(" monitor:", self.monitor.summary(), "integration:", f"{self.integration_degree:.3f}", "inconsistency_last:", (self.inconsistency_history[-1] if self.inconsistency_history else 0.0))
+        if self.cycle % 50 == 0:
+            removed = self.memory.prune()
+            if removed:
+                persona_record_event("system", {"type":"prune_summary", "removed": len(removed)}, secure=(PRIVACY_MODE!="private_only"))
+        self.body.decay_trauma()
+        return {"cycle": self.cycle, "status":"work", "produced": produced, "fatigue": self.body.fatigue, "valence": self.body.valence}
+
+# -------------------------
+# 启动与示例（main）
+# -------------------------
+def build_thinkers(n: int = INITIAL_THINKER_COUNT) -> List[Thinker]:
+    names = ["余光","夜河","旧信","星尘","微光","回声","纸船","风铃","月牙","灰烬","河流","夜灯"]
+    base_styles = [{"emotional":0.6,"rational":0.4,"curiosity":0.6},{"emotional":0.4,"rational":0.6,"curiosity":0.5},{"emotional":0.7,"rational":0.3,"curiosity":0.7}]
+    thinkers = []
+    for i in range(n):
+        name = names[i % len(names)] + (f"_{i}" if i >= len(names) else "")
+        style = base_styles[i % len(base_styles)].copy()
+        t = Thinker(id=uid(), name=name, essence=f"{name} 的本质", poetic=f"{name} 的诗意", style=style)
+        thinkers.append(t)
+    return thinkers
+
+def main():
+    ensure_dir(SHARD_DIR)
+    ensure_dir(AUDIT_DIR)
+    ensure_dir(SECURE_LOG_DIR)
+    hippocampus = HippocampusMemory(shard_dir=SHARD_DIR, index_file=INDEX_FILE, preload=True)
+    distributed = DistributedStore(db_path=DISTRIBUTED_DB)
+    hybrid = HybridMemoryManager(hippocampus, distributed, policy=HYBRID_POLICY)
+    thinkers = build_thinkers(INITIAL_THINKER_COUNT)
+    graph = ConceptGraph()
+    env = Environment(speed_factor=60.0)
+    connector = ConnectorSimulator()
+    social = SocialPlanner(None, connector, SOCIAL_CONFIG)
+    engine = CoreEngine(thinkers, hybrid, graph, env, social)
+    social.engine = engine
+
+    print(f"[{DISPLAY_NAME}] 启动：cycles={RUN_CYCLES} PRIVACY_MODE={PRIVACY_MODE} ALLOW_DEVELOPER_OVERRIDE={ALLOW_DEVELOPER_OVERRIDE}")
+    start = time.time()
+    try:
+        for i in range(RUN_CYCLES):
+            res = engine.run_cycle()
+            # 保证每周期至少一行输出（engine.run_cycle 内已打印）
+            # 仍保留外部命令示例触发
+            if i % 20 == 10:
+                cmd = {"action":"force_work", "issuer":"developer_console"}
+                resp = engine.handle_external_command(cmd)
+                print(f"[外部命令] developer -> force_work: {resp['status']} | {resp['message']}")
+            time.sleep(INTERVAL_BASE + random.random()*(INTERVAL_MAX-INTERVAL_BASE))
+    except KeyboardInterrupt:
+        print("中断，开始清理...")
+    finally:
+        hybrid.shutdown()
+        elapsed = time.time() - start
+        print(f"[{DISPLAY_NAME}] 运行完成：cycles={RUN_CYCLES} 用时={elapsed:.2f}s")
+        print("Monitor summary:", engine.monitor.summary())
+
+if __name__ == "__main__":
+    main()
